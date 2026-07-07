@@ -1,0 +1,15 @@
+[project]
+name = "parser-service"
+version = "0.1.0"
+description = "Telegram-парсинг + очередь задач (Celery/Redis) для мультиагентной системы поиска клиентов"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "celery>=5.6.3",
+    "psycopg2-binary>=2.9.12",
+    "python-dotenv>=1.2.2",
+    "redis>=8.0.1",
+    "sqlmodel>=0.0.39",
+    "telethon>=1.44.0",
+    "tenacity>=9.1.4",
+]

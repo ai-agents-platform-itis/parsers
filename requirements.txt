@@ -1,0 +1,12 @@
+# Прямые зависимости parser_service (Спринт 1).
+# Источник истины — pyproject.toml + uv.lock. Этот файл для установки без uv:
+#   pip install -r requirements.txt
+# Точные версии всех транзитивных пакетов зафиксированы в uv.lock.
+
+telethon>=1.44        # клиент Telegram (MTProto)
+celery>=5.6           # очередь задач
+redis>=8.0            # брокер/бэкенд Celery + счётчик исходящих
+sqlmodel>=0.0.39      # ORM-модели (SQLAlchemy + Pydantic)
+psycopg2-binary>=2.9  # драйвер Postgres
+python-dotenv>=1.0    # чтение .env
+tenacity>=9.0         # ретраи (задел под сетевые вызовы AI Core)
