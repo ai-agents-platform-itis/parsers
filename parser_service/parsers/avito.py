@@ -90,15 +90,21 @@ class AvitoParser(BaseParser):
     platform = "avito"
 
     def fetch_items(self, source: MonitoredSource) -> list[ParsedItem]:
-        with browser_context() as ctx:
+        with browser_context() as (ctx, proxy):
             page = ctx.new_page()
             try:
                 page.goto(source.identifier, wait_until="domcontentloaded")
                 if _looks_blocked(page):
+                    # Антибот сработал — вероятно, сгорел IP этого прокси.
+                    if proxy is not None:
+                        from parser_service.proxy_pool import get_pool
+
+                        get_pool().mark_bad(proxy)
                     logger.warning(
-                        "[avito] Антибот-страница для %s — пропускаю прогон. "
-                        "Реже поллинг / смени IP (прокси — Спринт 4).",
+                        "[avito] Антибот-страница для %s — пропускаю прогон "
+                        "(прокси %s на кулдаун). Следующий прогон — с другого IP.",
                         source.identifier,
+                        proxy.identity if proxy else "off",
                     )
                     return []
                 try:

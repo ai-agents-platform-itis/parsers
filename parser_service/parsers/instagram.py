@@ -129,7 +129,7 @@ class InstagramParser(BaseParser):
                 "почти наверняка покажет стену логина."
             )
 
-        with browser_context(cookies=cookies) as ctx:
+        with browser_context(cookies=cookies) as (ctx, proxy):
             page = ctx.new_page()
             try:
                 page.goto(source.identifier, wait_until="domcontentloaded")
@@ -137,10 +137,17 @@ class InstagramParser(BaseParser):
                 page.wait_for_timeout(5_000)
 
                 if _hit_login_wall(page):
+                    # Стена логина может быть и из-за спалившегося IP прокси —
+                    # ставим на кулдаун, следующий прогон пойдёт с другого.
+                    if proxy is not None:
+                        from parser_service.proxy_pool import get_pool
+
+                        get_pool().mark_bad(proxy)
                     logger.warning(
                         "[instagram] Стена логина для %s — проверь/обнови "
-                        "INSTAGRAM_SESSIONID в .env.",
+                        "INSTAGRAM_SESSIONID (прокси %s на кулдаун).",
                         source.identifier,
+                        proxy.identity if proxy else "off",
                     )
                     return []
 

@@ -57,12 +57,21 @@ def _resolve_peer(contact: str) -> str | int:
 
 
 async def _send(contact: str, text: str) -> None:
+    from parser_service.proxy_pool import get_pool, next_proxy
+
+    proxy = next_proxy()  # ротация прокси (Спринт 4); None если выключены
     client = TelegramClient(
         session=settings.sender_session_name,
         api_id=settings.api_id,
         api_hash=settings.api_hash,
+        proxy=proxy.telethon_proxy() if proxy else None,
     )
-    await client.connect()
+    try:
+        await client.connect()
+    except (OSError, ConnectionError, asyncio.TimeoutError):
+        if proxy is not None:
+            get_pool().mark_bad(proxy)
+        raise
     try:
         if not await client.is_user_authorized():
             raise SenderNotAuthorized(
@@ -98,10 +107,14 @@ def main() -> None:
         raise RuntimeError("Не заданы API_ID / API_HASH в .env")
 
     async def _auth() -> None:
+        from parser_service.proxy_pool import next_proxy
+
+        proxy = next_proxy()
         client = TelegramClient(
             session=settings.sender_session_name,
             api_id=settings.api_id,
             api_hash=settings.api_hash,
+            proxy=proxy.telethon_proxy() if proxy else None,
         )
         await client.start()  # спросит телефон и код при первом запуске
         me = await client.get_me()

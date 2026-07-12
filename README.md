@@ -1,9 +1,10 @@
-# parser_service — парсинг Telegram/Avito/Instagram, CRM и очередь задач (Спринты 1-3)
+# parser_service — парсинг Telegram/Avito/Instagram, CRM и очередь задач (Спринты 1-4)
 
 Часть мультиагентной системы поиска клиентов (зона **Integration & Parsing**).
 Сервис мониторит источники (Telegram-чаты, выдачи Avito, посты Instagram) по
 триггерным словам своей ниши, создаёт лидов, скорит их и передаёт «горячих»
-в AmoCRM + менеджеру. Ответы от AI Core — точка интеграции (TODO).
+в AmoCRM + менеджеру. Запросы к площадкам раскидываются по ротируемому пулу
+прокси. Ответы от AI Core — точка интеграции (TODO).
 
 ## Что уже есть
 
@@ -41,14 +42,25 @@
   (одну SQLite-сессию нельзя делить между listener и воркером). Listener
   теперь сохраняет `@username` лида — по нему воркер может написать.
 
+Спринт 4:
+- **Ротация прокси** (`proxy_pool.py`): заглушка Спринта 1 заменена реальным
+  пулом. Список из `PROXY_LIST`/`PROXY_FILE`, round-robin через общий счётчик
+  в Redis (listener и воркер делят ротацию), «сгоревший» прокси уходит на
+  кулдаун (`PROXY_COOLDOWN_SECONDS`) при ошибке подключения Telethon или
+  антибот-странице Avito/Instagram. Работает и для Telethon (python-socks),
+  и для Playwright.
+- **Стресс-режим 3 ниши** (`scripts/stress_seed.py`): поднимает кампании
+  Участки/Гемблинг/Услуги разом для нагрузочного теста.
+
 ## Структура
 
 ```
 parser_service/
-├── config.py              # чтение .env: парсеры, AmoCRM, горячие лиды, отправка
+├── config.py              # чтение .env: парсеры, AmoCRM, горячие лиды, прокси
 ├── niches.py              # пресеты ниш: триггеры/regex/действия (Спринт 2)
 ├── triggers.py            # per-campaign правила из Campaign.settings (Спринт 2)
 ├── scoring.py             # интерим-скоринг лида 0..100 (Спринт 3)
+├── proxy_pool.py          # пул прокси: ротация + кулдаун битых (Спринт 4)
 ├── db/
 │   ├── models.py          # Campaign, MonitoredChat, MonitoredSource, Lead, Message
 │   └── session.py         # engine + сессии, init_db()
@@ -69,6 +81,7 @@ parser_service/
     ├── celery_config.py   # инстанс Celery + beat_schedule поллеров
     └── tasks.py           # process/send/push_hot_lead + поллеры
 scripts/seed.py            # кампания из пресета + чат/источник в БД
+scripts/stress_seed.py     # 3 ниши разом для стресс-теста (Спринт 4)
 docker-compose.yml         # Postgres + Redis для локальной разработки
 ```
 
@@ -222,6 +235,36 @@ uv run python -m parser_service.telegram.listener
 > существующие таблицы — выполни один раз:
 > `ALTER TABLE leads ADD COLUMN IF NOT EXISTS crm_lead_id INTEGER;`
 > (нормальные миграции — Alembic, зона Core Backend).
+
+## Ротация прокси и стресс-тест (Спринт 4)
+
+Включение — одной строкой: `PROXY_ENABLED=true` + список в `PROXY_LIST`:
+
+```bash
+PROXY_ENABLED=true
+PROXY_LIST=socks5://user:pass@1.2.3.4:1080, http://5.6.7.8:8080, socks5://9.10.11.12:1080
+# либо длинный список файлом (по одному прокси на строку):
+PROXY_FILE=proxies.txt
+```
+
+Как работает пул (`proxy_pool.py`):
+- **Ротация** — round-robin через общий счётчик в Redis, поэтому listener,
+  воркер и поллеры Avito/IG вместе равномерно раскидывают запросы по IP.
+- **Health** — при ошибке подключения Telethon или антибот-странице
+  (Avito «доступ ограничен», IG стена логина) прокси уходит на кулдаун
+  `PROXY_COOLDOWN_SECONDS` и не выдаётся, пока не «остынет». Если остыли все —
+  парсер временно работает напрямую, а не падает.
+- Форматы: `socks5://`, `socks4://`, `http://`, `https://`, с авторизацией
+  и без. Telethon ходит через `python-socks`, Playwright — через свой
+  `proxy=`.
+
+Нагрузочный тест на трёх нишах разом:
+
+```bash
+uv run python -m scripts.stress_seed                # демо-набор
+uv run python -m scripts.stress_seed --config sources.txt
+# затем при включённых прокси — listener + worker -B (см. выше)
+```
 
 ## Точки интеграции (TODO для других участников)
 

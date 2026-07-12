@@ -209,12 +209,31 @@ async def run() -> None:
         )
     campaign_settings = _load_campaign_settings({c.campaign_id for c in chats})
 
-    client = create_client()
+    client, proxy = create_client()
 
     # На случай FloodWait при подключении/резолве — оборачиваем в цикл.
     while True:
         try:
-            await client.start()  # авторизация по сессии из .env
+            try:
+                await client.start()  # авторизация по сессии из .env
+            except (OSError, ConnectionError, asyncio.TimeoutError) as e:
+                # Похоже на дохлый прокси: помечаем битым и переподключаемся
+                # на следующем из пула (Спринт 4, ротация).
+                if proxy is not None:
+                    from parser_service.proxy_pool import get_pool
+
+                    get_pool().mark_bad(proxy)
+                    logger.warning(
+                        "Ошибка подключения через прокси %s (%s) — беру другой.",
+                        proxy.identity,
+                        e,
+                    )
+                    if client.is_connected():
+                        await client.disconnect()
+                    client, proxy = create_client()
+                    await asyncio.sleep(3)
+                    continue
+                raise
             logger.info("Клиент Telegram подключён.")
 
             # Собираем карту target -> chat. Резолвим сущности заранее.

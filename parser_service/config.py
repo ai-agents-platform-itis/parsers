@@ -28,29 +28,66 @@ def _get_int(name: str, default: int | None = None) -> int | None:
 @dataclass(frozen=True)
 class ProxyConfig:
     """
-    Настройки прокси для Telethon.
+    Настройки прокси (Спринт 4: ротация пула).
 
-    На старте проекта прокси НЕ используется (enabled=False). Позже включается
-    одной строкой в .env: PROXY_ENABLED=true + заполнить хост/порт/тип.
-    Реальный код подключения прокси в client.py — заглушка (см. TODO там).
+    Прокси включается PROXY_ENABLED=true. Список адресов задаётся в .env:
+      * PROXY_LIST — несколько прокси через запятую/перенос строки, каждый
+        в URL-форме: socks5://user:pass@host:port или http://host:port
+      * PROXY_FILE — путь к файлу со списком (по одному на строку) как
+        альтернатива/дополнение PROXY_LIST (удобно для длинных списков)
+    Для обратной совместимости со Спринтом 1 одиночный прокси через
+    PROXY_HOST/PROXY_PORT/PROXY_TYPE/PROXY_USERNAME/PROXY_PASSWORD тоже
+    подхватывается и добавляется в пул.
+
+    Сам пул и логику ротации/health см. в parser_service.proxy_pool.
     """
 
     enabled: bool = False
-    proxy_type: str | None = None  # socks5 / http и т.п.
-    host: str | None = None
-    port: int | None = None
-    username: str | None = None
-    password: str | None = None
+    # Сырые URL прокси (парсятся в proxy_pool.Proxy). Пустой список = пул пуст.
+    urls: tuple[str, ...] = ()
+    # Секунды «остывания» прокси после ошибки (бан/таймаут) — в это время
+    # он не выдаётся из пула.
+    cooldown_seconds: int = 300
+
+    @staticmethod
+    def _legacy_single_url() -> str | None:
+        """Собрать URL из одиночных PROXY_HOST/PORT/... (совместимость)."""
+        host = os.getenv("PROXY_HOST")
+        port = os.getenv("PROXY_PORT")
+        if not host or not port:
+            return None
+        scheme = os.getenv("PROXY_TYPE") or "socks5"
+        user = os.getenv("PROXY_USERNAME")
+        pwd = os.getenv("PROXY_PASSWORD")
+        auth = f"{user}:{pwd}@" if user and pwd else ""
+        return f"{scheme}://{auth}{host}:{port}"
 
     @classmethod
     def from_env(cls) -> "ProxyConfig":
+        raw = os.getenv("PROXY_LIST", "")
+        urls = [u.strip() for u in raw.replace("\n", ",").split(",") if u.strip()]
+
+        proxy_file = os.getenv("PROXY_FILE")
+        if proxy_file and os.path.isfile(proxy_file):
+            with open(proxy_file, encoding="utf-8") as f:
+                urls += [
+                    line.strip()
+                    for line in f
+                    if line.strip() and not line.lstrip().startswith("#")
+                ]
+
+        legacy = cls._legacy_single_url()
+        if legacy:
+            urls.append(legacy)
+
+        # Убираем дубли, сохраняя порядок.
+        seen: set[str] = set()
+        unique = [u for u in urls if not (u in seen or seen.add(u))]
+
         return cls(
             enabled=os.getenv("PROXY_ENABLED", "false").lower() == "true",
-            proxy_type=os.getenv("PROXY_TYPE"),
-            host=os.getenv("PROXY_HOST"),
-            port=_get_int("PROXY_PORT"),
-            username=os.getenv("PROXY_USERNAME"),
-            password=os.getenv("PROXY_PASSWORD"),
+            urls=tuple(unique),
+            cooldown_seconds=_get_int("PROXY_COOLDOWN_SECONDS", 300) or 300,
         )
 
 
