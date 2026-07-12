@@ -157,8 +157,13 @@ class Lead(SQLModel, table=True):
     # Контакт: Telegram user_id/username для последующей связи.
     contact: Optional[str] = Field(default=None, index=True)
     status: LeadStatus = Field(default=LeadStatus.NEW, index=True)
-    # Скоринг лида (0..100), проставляется AI-агентом позже.
+    # Скоринг лида (0..100). Пока интерим-эвристика (scoring.py), позже —
+    # Агент-Квалификатор из LangGraph (зона AI Core).
     score: int = Field(default=0)
+    # id сделки в AmoCRM после передачи «горячего» лида (Спринт 3).
+    # ВНИМАНИЕ: init_db() не добавляет колонки в существующие таблицы —
+    # на живой БД Спринта 1-2 нужен ручной ALTER (см. README, миграции — Alembic).
+    crm_lead_id: Optional[int] = Field(default=None)
     created_at: datetime = Field(default_factory=datetime.utcnow)
 
     campaign: Optional[Campaign] = Relationship(back_populates="leads")

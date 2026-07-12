@@ -90,21 +90,30 @@ def _resolve_chat_target(chat: MonitoredChat):
 async def _persist_lead_and_message(
     chat: MonitoredChat,
     sender_id: int | None,
+    sender_username: str | None,
     text: str,
 ) -> int | None:
     """
     Создать Lead и входящий Message в БД. Вернуть message_id (или None).
 
+    contact: предпочитаем @username — по нему воркер-отправитель сможет
+    написать лиду (по голому user_id другая сессия отправить не может),
+    и менеджеру в CRM он полезнее. Фолбэк — числовой id.
+
     Работа с синхронной сессией короткая, поэтому оборачиваем в to_thread,
     чтобы не блокировать event loop Telethon.
     """
+    if sender_username:
+        contact = f"@{sender_username}"
+    else:
+        contact = str(sender_id) if sender_id is not None else None
 
     def _write() -> int:
         with get_session() as db:
             lead = Lead(
                 campaign_id=chat.campaign_id,
                 source=f"telegram:{chat.chat_identifier}",
-                contact=str(sender_id) if sender_id is not None else None,
+                contact=contact,
                 status=LeadStatus.NEW,
             )
             db.add(lead)
@@ -161,10 +170,19 @@ def _register_handler(
             text[:120],
         )
 
+        # username отправителя (если есть) — для контакта лида.
+        sender_username: str | None = None
+        try:
+            sender = await event.get_sender()
+            sender_username = getattr(sender, "username", None)
+        except Exception:  # noqa: BLE001 — не критично, обойдёмся id
+            logger.debug("Не удалось получить sender для %s", event.sender_id)
+
         try:
             message_id = await _persist_lead_and_message(
                 chat=chat,
                 sender_id=event.sender_id,
+                sender_username=sender_username,
                 text=text,
             )
         except Exception:  # noqa: BLE001 — не роняем listener из-за одной ошибки БД

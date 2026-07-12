@@ -1,9 +1,9 @@
-# parser_service — парсинг Telegram/Avito/Instagram + очередь задач (Спринты 1-2)
+# parser_service — парсинг Telegram/Avito/Instagram, CRM и очередь задач (Спринты 1-3)
 
 Часть мультиагентной системы поиска клиентов (зона **Integration & Parsing**).
 Сервис мониторит источники (Telegram-чаты, выдачи Avito, посты Instagram) по
-триггерным словам своей ниши, создаёт лидов и ставит обработку в очередь
-Celery. Ответы от AI Core — точка интеграции (TODO).
+триггерным словам своей ниши, создаёт лидов, скорит их и передаёт «горячих»
+в AmoCRM + менеджеру. Ответы от AI Core — точка интеграции (TODO).
 
 ## Что уже есть
 
@@ -26,28 +26,48 @@ Celery. Ответы от AI Core — точка интеграции (TODO).
 - **Celery beat**: `poll_avito` / `poll_instagram` по расписанию, дедуп
   обработанных элементов в Redis (TTL `SEEN_ITEMS_TTL_DAYS`).
 
+Спринт 3:
+- **AmoCRM** (`crm/amocrm.py`): «горячий» лид уходит сделкой+контактом
+  (complex-эндпоинт api/v4, долгосрочный токен), история диалога —
+  примечанием, ниша/платформа — тегами. `Lead.crm_lead_id` — связь с amo.
+- **Скоринг и порог** (`scoring.py`): интерим-эвристика 0..100 (до
+  Агента-Квалификатора из LangGraph); `score >= HOT_LEAD_THRESHOLD` →
+  статус `qualified` → задача `push_hot_lead`.
+- **Уведомление менеджера** (`crm/notify.py`): пинг в Telegram через обычный
+  Bot API (токен `MANAGER_BOT_TOKEN`, чат `MANAGER_CHAT_ID`) со ссылкой на
+  сделку в CRM.
+- **Реальная отправка в Telegram** (`telegram/sender.py`): включается
+  `TELEGRAM_SEND_ENABLED=true`, работает через отдельную сессию Telethon
+  (одну SQLite-сессию нельзя делить между listener и воркером). Listener
+  теперь сохраняет `@username` лида — по нему воркер может написать.
+
 ## Структура
 
 ```
 parser_service/
-├── config.py              # чтение .env, legacy-триггеры, настройки парсеров
+├── config.py              # чтение .env: парсеры, AmoCRM, горячие лиды, отправка
 ├── niches.py              # пресеты ниш: триггеры/regex/действия (Спринт 2)
 ├── triggers.py            # per-campaign правила из Campaign.settings (Спринт 2)
+├── scoring.py             # интерим-скоринг лида 0..100 (Спринт 3)
 ├── db/
 │   ├── models.py          # Campaign, MonitoredChat, MonitoredSource, Lead, Message
 │   └── session.py         # engine + сессии, init_db()
 ├── telegram/
 │   ├── client.py          # TelegramClient (Telethon) + proxy-заглушка
 │   ├── listener.py        # мониторинг чатов, FloodWaitError, постановка в Celery
+│   ├── sender.py          # реальная отправка из воркера (отдельная сессия)
 │   └── triggers.py        # шим: реэкспорт из parser_service.triggers
 ├── parsers/
 │   ├── base.py            # общий пайплайн: fetch → дедуп → триггер → Lead → Celery
 │   ├── browser.py         # общий Playwright-контекст (UA, headless из .env)
 │   ├── avito.py           # поллинг выдач Avito (data-marker селекторы)
 │   └── instagram.py       # комментарии постов IG (sessionid-кука)
+├── crm/
+│   ├── amocrm.py          # api/v4: сделка+контакт, примечания, теги (Спринт 3)
+│   └── notify.py          # пинг менеджеру через Telegram Bot API (Спринт 3)
 └── celery_app/
     ├── celery_config.py   # инстанс Celery + beat_schedule поллеров
-    └── tasks.py           # process/send + poll_avito, poll_instagram
+    └── tasks.py           # process/send/push_hot_lead + поллеры
 scripts/seed.py            # кампания из пресета + чат/источник в БД
 docker-compose.yml         # Postgres + Redis для локальной разработки
 ```
@@ -177,13 +197,39 @@ uv run python -m parser_service.telegram.listener
   Соблюдаем правила площадок (ТЗ, раздел 3): редкий поллинг, паузы между
   источниками.
 
+## Горячие лиды → AmoCRM → менеджер (Спринт 3)
+
+Воронка: входящее сообщение → интерим-скоринг (`scoring.py`) → при
+`score >= HOT_LEAD_THRESHOLD` лид получает статус `qualified` и задача
+`push_hot_lead` создаёт сделку в AmoCRM (диалог — примечанием, ниша и
+платформа — тегами) + отправляет пинг менеджеру в Telegram.
+
+Настройка:
+
+1. **AmoCRM**: Настройки → Интеграции → создать свою интеграцию → «Ключи и
+   доступы» → долгосрочный токен. В `.env`: `AMOCRM_BASE_URL`
+   (https://yourcompany.amocrm.ru) и `AMOCRM_ACCESS_TOKEN`. Без них CRM-шаг
+   мягко пропускается (менеджер всё равно уведомляется).
+2. **Бот-нотификатор**: создать бота у @BotFather → `MANAGER_BOT_TOKEN`;
+   chat_id менеджера узнать у @userinfobot → `MANAGER_CHAT_ID`; менеджер
+   должен один раз нажать Start у бота.
+3. **Реальная отправка лидам** (опционально): `TELEGRAM_SEND_ENABLED=true` и
+   разовая авторизация отдельной сессии отправителя:
+   `uv run python -m parser_service.telegram.sender`. Отправка идёт по
+   `@username` лида; лиды без username остаются менеджеру (контакт в CRM).
+
+> **Живая БД со Спринтов 1-2**: `init_db()` не добавляет колонки в
+> существующие таблицы — выполни один раз:
+> `ALTER TABLE leads ADD COLUMN IF NOT EXISTS crm_lead_id INTEGER;`
+> (нормальные миграции — Alembic, зона Core Backend).
+
 ## Точки интеграции (TODO для других участников)
 
 - **AI Core** (`triggers.build_reply_placeholder`, `tasks.process_incoming_message`):
-  вызов `POST /api/chat` вернёт реальный текст ответа с учётом RAG кампании.
-- **Отправка в Telegram** (`tasks.send_outgoing_message`): сейчас заглушка +
-  учёт лимита; реальная отправка пойдёт через `TelegramClient`.
-- **Прокси** (`client._build_proxy`): включается через `PROXY_*` в `.env`.
+  вызов `POST /api/chat` вернёт реальный текст ответа с учётом RAG кампании и
+  score от Агента-Квалификатора (заменит интерим-эвристику `scoring.py`).
+- **Прокси** (`client._build_proxy`): включается через `PROXY_*` в `.env`;
+  ротация прокси — Спринт 4.
 
 ## Заметки по лимитам
 

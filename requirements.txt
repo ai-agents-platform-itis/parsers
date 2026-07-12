@@ -1,4 +1,4 @@
-# Прямые зависимости parser_service (Спринты 1-2).
+# Прямые зависимости parser_service (Спринты 1-3).
 # Источник истины — pyproject.toml + uv.lock. Этот файл для установки без uv:
 #   pip install -r requirements.txt
 # Точные версии всех транзитивных пакетов зафиксированы в uv.lock.
@@ -12,3 +12,4 @@ python-dotenv>=1.0    # чтение .env
 tenacity>=9.0         # ретраи (задел под сетевые вызовы AI Core)
 playwright>=1.49      # веб-парсеры Avito/Instagram (после установки:
                       #   playwright install chromium)
+requests>=2.32        # AmoCRM API + Telegram Bot API (уведомления менеджеру)

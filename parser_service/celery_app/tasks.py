@@ -2,7 +2,9 @@
 Celery-задачи парсер-сервиса.
 
 Задачи:
-  * process_incoming_message — обработка входящего (тут позже будет вызов AI Core).
+  * process_incoming_message — обработка входящего: интерим-скоринг + передача
+    «горячих» лидов (вызов AI Core — точка интеграции, TODO).
+  * push_hot_lead — сделка в AmoCRM + уведомление менеджера (Спринт 3).
   * send_outgoing_message    — отправка исходящего с суточным лимитом (лимиты TG).
   * poll_avito / poll_instagram — периодический поллинг веб-источников
     (запускаются Celery beat, см. beat_schedule в celery_config).
@@ -60,19 +62,49 @@ def process_incoming_message(message_id: int) -> None:
     """
     Обработать входящее сообщение (найденный триггером лид-контакт).
 
+    Спринт 3: считаем интерим-скоринг (scoring.py) и, если лид «горячий»
+    (score >= HOT_LEAD_THRESHOLD), передаём его в CRM + менеджеру.
+
     ТОЧКА ИНТЕГРАЦИИ С AI CORE:
     Здесь позже будет вызов AI Core API — POST /api/chat, который вернёт
-    текст ответа с учётом RAG-базы кампании, после чего мы поставим
-    send_outgoing_message. Пока — только лог-заглушка.
+    текст ответа с учётом RAG-базы кампании И score от Агента-Квалификатора
+    (заменит интерим-эвристику), после чего мы поставим send_outgoing_message.
     """
+    from parser_service.scoring import estimate_score
+    from parser_service.triggers import ruleset_for_campaign
+
     logger.info("process_incoming_message: message_id=%s", message_id)
 
-    # Подтягиваем сообщение (демонстрация сквозного пайплайна).
+    hot_lead_id: int | None = None
     with get_session() as db:
         message = db.get(Message, message_id)
         if message is None:
             logger.warning("Сообщение id=%s не найдено в БД", message_id)
             return
+        lead = db.get(Lead, message.lead_id)
+        campaign = db.get(Campaign, lead.campaign_id) if lead else None
+        if lead is None or campaign is None:
+            logger.warning("Лид/кампания для сообщения id=%s не найдены", message_id)
+            return
+
+        # Интерим-скоринг по триггерам кампании (до Агента-Квалификатора).
+        ruleset = ruleset_for_campaign(campaign.id, campaign.settings)
+        score = estimate_score(message.text, ruleset.match(message.text))
+        if score > lead.score:
+            lead.score = score
+            db.add(lead)
+        logger.info("Лид id=%s: score=%s (порог=%s)", lead.id, lead.score, settings.hot_lead_threshold)
+
+        # «Горячий» и ещё не передан в CRM -> квалифицируем и передаём.
+        if lead.score >= settings.hot_lead_threshold and lead.crm_lead_id is None:
+            if lead.status in (LeadStatus.NEW, LeadStatus.CONTACTED):
+                lead.status = LeadStatus.QUALIFIED
+                db.add(lead)
+            hot_lead_id = lead.id
+
+    if hot_lead_id is not None:
+        push_hot_lead.delay(hot_lead_id)
+        logger.info("Лид id=%s горячий — передаю в CRM/менеджеру", hot_lead_id)
 
     # TODO(AI Core): вызвать AI Core API.
     #   POST {AI_CORE_URL}/api/chat
@@ -80,6 +112,99 @@ def process_incoming_message(message_id: int) -> None:
     #   reply = response.json()["reply"]
     #   send_outgoing_message.delay(lead_id=message.lead_id, text=reply)
     logger.info("would call AI core here (message_id=%s)", message_id)
+
+
+# =============================================================================
+# push_hot_lead — «горячий» лид в AmoCRM + уведомление менеджера (Спринт 3)
+# =============================================================================
+@celery_app.task(
+    bind=True,
+    name="parser.push_hot_lead",
+    max_retries=5,
+    default_retry_delay=60,
+)
+def push_hot_lead(self, lead_id: int) -> None:
+    """
+    Передать «горячий» лид: сделка+контакт в AmoCRM (с историей диалога
+    примечанием) и сообщение менеджеру через бот-нотификатор.
+
+    Если AmoCRM не настроен в .env — CRM-шаг пропускается (менеджер всё
+    равно уведомляется). Сетевые сбои amo -> retry задачи.
+    """
+    import requests as _requests
+
+    from parser_service.crm import amocrm, notify
+
+    with get_session() as db:
+        lead = db.get(Lead, lead_id)
+        if lead is None:
+            logger.warning("push_hot_lead: лид id=%s не найден", lead_id)
+            return
+        campaign = db.get(Campaign, lead.campaign_id)
+        messages = db.exec(
+            select(Message)
+            .where(Message.lead_id == lead_id)
+            .order_by(Message.timestamp)  # type: ignore[arg-type]
+        ).all()
+
+        niche = campaign.niche_type if campaign else "unknown"
+        platform = (lead.source or "unknown").split(":", 1)[0]
+        contact = lead.contact or "не определён"
+        already_in_crm = lead.crm_lead_id is not None
+        score = lead.score
+        source = lead.source or "-"
+        dialog = "\n".join(
+            f"[{m.direction.value}] {m.text}" for m in messages
+        )
+
+    crm_lead_id: int | None = None
+    if already_in_crm:
+        logger.info("push_hot_lead: лид id=%s уже в CRM — пропускаю", lead_id)
+    elif not amocrm.is_configured():
+        logger.warning(
+            "AmoCRM не настроен (.env AMOCRM_*) — лид id=%s в CRM не передан.",
+            lead_id,
+        )
+    else:
+        try:
+            crm_lead_id = amocrm.create_lead(
+                name=f"[{niche}] лид #{lead_id} ({platform})",
+                contact_name=contact,
+                tags=[niche, platform, "auto-parser"],
+            )
+            amocrm.add_note(
+                crm_lead_id,
+                f"Источник: {source}\nКонтакт: {contact}\nScore: {score}\n\n"
+                f"Диалог:\n{dialog}",
+            )
+        except _requests.RequestException as exc:
+            logger.warning("AmoCRM недоступен (%s) — retry задачи", exc)
+            raise self.retry(exc=exc)
+
+        with get_session() as db:
+            lead = db.get(Lead, lead_id)
+            if lead is not None:
+                lead.crm_lead_id = crm_lead_id
+                db.add(lead)
+
+    # Уведомление менеджера — best-effort: его сбой не должен ронять/
+    # ретраить CRM-шаг (сделка уже создана).
+    if notify.is_configured():
+        text = (
+            f"🔥 Горячий лид #{lead_id} (score {score})\n"
+            f"Ниша: {niche}\nИсточник: {source}\nКонтакт: {contact}"
+        )
+        if crm_lead_id and settings.amocrm_base_url:
+            text += f"\nCRM: {settings.amocrm_base_url.rstrip('/')}/leads/detail/{crm_lead_id}"
+        try:
+            notify.send_to_manager(text)
+        except Exception:  # noqa: BLE001
+            logger.exception("Не удалось уведомить менеджера о лиде id=%s", lead_id)
+    else:
+        logger.info(
+            "Бот-нотификатор не настроен (MANAGER_BOT_TOKEN/MANAGER_CHAT_ID) — "
+            "уведомление менеджеру пропущено."
+        )
 
 
 # =============================================================================
@@ -119,19 +244,58 @@ def send_outgoing_message(self, lead_id: int, text: str, account: str = "default
         # Возвращаем задачу в отложенную очередь.
         raise self.retry(countdown=retry_in)
 
-    # --- Лимит не превышен: «отправляем» ---
-    # TODO(Telethon): здесь будет реальная отправка через TelegramClient.
-    #   Отправку удобнее делать в отдельном процессе с event loop Telethon
-    #   (например, через общую очередь), т.к. Celery-воркер синхронный.
-    #   Пока — заглушка + запись исходящего в БД и инкремент счётчика.
-    logger.info("Отправка (заглушка) lead_id=%s: %r", lead_id, text)
-
     with get_session() as db:
         lead = db.get(Lead, lead_id)
         if lead is None:
             logger.warning("Lead id=%s не найден, отправку пропускаю", lead_id)
             return
+        contact = lead.contact
+        source = lead.source or ""
 
+    # --- Лимит не превышен: отправляем ---
+    if settings.telegram_send_enabled:
+        # Реальная отправка (Спринт 3) — пока только Telegram-лиды.
+        # Instagram/Avito: отправка через API площадок — задел на будущее.
+        if not source.startswith("telegram:"):
+            logger.info(
+                "Лид id=%s из %s — исходящие поддержаны только для Telegram, "
+                "пропускаю отправку.",
+                lead_id,
+                source,
+            )
+            return
+        if not contact:
+            logger.warning("У лида id=%s нет контакта — отправить некому.", lead_id)
+            return
+
+        from parser_service.telegram.sender import (
+            FloodWaitError,
+            PeerNotResolvable,
+            SenderNotAuthorized,
+            send_message_sync,
+        )
+
+        try:
+            send_message_sync(contact, text)
+        except FloodWaitError as e:
+            logger.warning("FloodWait при отправке lead_id=%s — retry через %s сек", lead_id, e.seconds)
+            raise self.retry(countdown=e.seconds + 5)
+        except (SenderNotAuthorized, PeerNotResolvable) as e:
+            # Ретрай не поможет: нужен логин сессии или у лида нет username.
+            # Лид не потерян — он в БД/CRM, менеджер свяжется вручную.
+            logger.error("Отправка lead_id=%s невозможна: %s", lead_id, e)
+            return
+    else:
+        logger.info(
+            "Отправка (заглушка, TELEGRAM_SEND_ENABLED=false) lead_id=%s: %r",
+            lead_id,
+            text,
+        )
+
+    with get_session() as db:
+        lead = db.get(Lead, lead_id)
+        if lead is None:
+            return
         db.add(
             Message(
                 lead_id=lead_id,
