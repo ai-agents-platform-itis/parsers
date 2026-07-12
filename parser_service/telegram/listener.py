@@ -24,6 +24,7 @@ from telethon.errors import FloodWaitError
 from parser_service.celery_app.tasks import process_incoming_message
 from parser_service.config import settings
 from parser_service.db.models import (
+    Campaign,
     Lead,
     LeadStatus,
     Message,
@@ -32,7 +33,7 @@ from parser_service.db.models import (
 )
 from parser_service.db.session import get_session, init_db
 from parser_service.telegram.client import create_client
-from parser_service.telegram.triggers import match_triggers
+from parser_service.triggers import ruleset_for_campaign
 
 logging.basicConfig(
     level=settings.log_level,
@@ -55,6 +56,22 @@ def _load_active_chats() -> list[MonitoredChat]:
         ).all()
         # Отвязываем объекты от сессии (нужны только значения полей).
         return list(chats)
+
+
+def _load_campaign_settings(campaign_ids: set[int]) -> dict[int, dict]:
+    """
+    Подтянуть settings кампаний для per-campaign триггеров (Спринт 2).
+
+    Триггеры теперь живут в Campaign.settings["triggers"] — у каждой ниши
+    свой набор. Кампании без triggers работают по legacy-набору из config.
+    """
+    if not campaign_ids:
+        return {}
+    with get_session() as db:
+        campaigns = db.exec(
+            select(Campaign).where(Campaign.id.in_(campaign_ids))  # type: ignore[union-attr]
+        ).all()
+        return {c.id: dict(c.settings or {}) for c in campaigns}
 
 
 def _resolve_chat_target(chat: MonitoredChat):
@@ -105,19 +122,19 @@ async def _persist_lead_and_message(
     return await asyncio.to_thread(_write)
 
 
-def _register_handler(client: TelegramClient, chat_map: dict) -> None:
+def _register_handler(
+    client: TelegramClient, chat_map: dict, campaign_settings: dict[int, dict]
+) -> None:
     """
     Зарегистрировать один обработчик NewMessage на все мониторимые чаты.
     chat_map: {target -> MonitoredChat} для восстановления campaign_id.
+    campaign_settings: {campaign_id -> Campaign.settings} для триггеров ниши.
     """
     targets = list(chat_map.keys())
 
     @client.on(events.NewMessage(chats=targets))
     async def _handler(event: events.NewMessage.Event) -> None:
         text = event.message.message or ""
-        matches = match_triggers(text)
-        if not matches:
-            return  # сообщение без триггеров — игнорируем
 
         # Определяем, к какому мониторимому чату относится событие.
         chat = chat_map.get(event.chat_id) or chat_map.get(
@@ -126,6 +143,14 @@ def _register_handler(client: TelegramClient, chat_map: dict) -> None:
         if chat is None:
             # Фолбэк: берём первый (обычно targets из одного чата на событие).
             chat = next(iter(chat_map.values()))
+
+        # Триггеры ниши этой кампании (Спринт 2), с фолбэком на legacy-набор.
+        ruleset = ruleset_for_campaign(
+            chat.campaign_id, campaign_settings.get(chat.campaign_id)
+        )
+        matches = ruleset.match(text)
+        if not matches:
+            return  # сообщение без триггеров — игнорируем
 
         keywords = ", ".join(m.keyword for m in matches)
         logger.info(
@@ -164,6 +189,7 @@ async def run() -> None:
             "Нет активных чатов в MonitoredChats. Добавь чаты в БД "
             "(is_active=true) и перезапусти listener."
         )
+    campaign_settings = _load_campaign_settings({c.campaign_id for c in chats})
 
     client = create_client()
 
@@ -193,7 +219,7 @@ async def run() -> None:
                 await asyncio.sleep(30)
                 continue
 
-            _register_handler(client, chat_map)
+            _register_handler(client, chat_map, campaign_settings)
 
             logger.info("Слушаю новые сообщения. Ctrl+C для выхода.")
             await client.run_until_disconnected()

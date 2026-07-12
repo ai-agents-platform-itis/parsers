@@ -1,9 +1,11 @@
 """
 Celery-задачи парсер-сервиса.
 
-Две задачи:
+Задачи:
   * process_incoming_message — обработка входящего (тут позже будет вызов AI Core).
   * send_outgoing_message    — отправка исходящего с суточным лимитом (лимиты TG).
+  * poll_avito / poll_instagram — периодический поллинг веб-источников
+    (запускаются Celery beat, см. beat_schedule в celery_config).
 
 Redis используется и как брокер Celery, и как счётчик исходящих сообщений.
 """
@@ -14,10 +16,19 @@ import logging
 from datetime import datetime, timezone
 
 import redis
+from sqlmodel import select
 
 from parser_service.celery_app.celery_config import celery_app
 from parser_service.config import settings
-from parser_service.db.models import Lead, LeadStatus, Message, MessageDirection
+from parser_service.db.models import (
+    Campaign,
+    Lead,
+    LeadStatus,
+    Message,
+    MessageDirection,
+    MonitoredSource,
+    SourcePlatform,
+)
 from parser_service.db.session import get_session
 
 logger = logging.getLogger(__name__)
@@ -144,3 +155,48 @@ def send_outgoing_message(self, lead_id: int, text: str, account: str = "default
         settings.daily_outbox_limit,
         account,
     )
+
+
+# =============================================================================
+# Поллинг веб-источников: Avito / Instagram (Спринт 2)
+# =============================================================================
+def _load_sources(platform: SourcePlatform) -> list[tuple[MonitoredSource, Campaign]]:
+    """Активные источники платформы вместе с их кампаниями (для триггеров)."""
+    with get_session() as db:
+        rows = db.exec(
+            select(MonitoredSource, Campaign)
+            .join(Campaign, Campaign.id == MonitoredSource.campaign_id)  # type: ignore[arg-type]
+            .where(
+                MonitoredSource.platform == platform,
+                MonitoredSource.is_active == True,  # noqa: E712
+            )
+        ).all()
+        return [(source, campaign) for source, campaign in rows]
+
+
+@celery_app.task(name="parser.poll_avito", ignore_result=True)
+def poll_avito() -> None:
+    """Обойти активные источники Avito (запускается по расписанию beat)."""
+    # Импорт внутри задачи: parsers.base импортирует tasks (циклический импорт),
+    # плюс Playwright не нужен воркеру, который эти задачи не выполняет.
+    from parser_service.parsers.avito import poll_sources
+
+    sources = _load_sources(SourcePlatform.AVITO)
+    if not sources:
+        logger.info("poll_avito: активных источников нет")
+        return
+    total = poll_sources(sources)
+    logger.info("poll_avito: источников=%d, новых лидов=%d", len(sources), total)
+
+
+@celery_app.task(name="parser.poll_instagram", ignore_result=True)
+def poll_instagram() -> None:
+    """Обойти активные источники Instagram (запускается по расписанию beat)."""
+    from parser_service.parsers.instagram import poll_sources
+
+    sources = _load_sources(SourcePlatform.INSTAGRAM)
+    if not sources:
+        logger.info("poll_instagram: активных источников нет")
+        return
+    total = poll_sources(sources)
+    logger.info("poll_instagram: источников=%d, новых лидов=%d", len(sources), total)

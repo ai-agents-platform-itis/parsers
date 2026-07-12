@@ -1,33 +1,54 @@
-# parser_service — Telegram-парсинг + очередь задач (Спринт 1)
+# parser_service — парсинг Telegram/Avito/Instagram + очередь задач (Спринты 1-2)
 
 Часть мультиагентной системы поиска клиентов (зона **Integration & Parsing**).
-Сервис мониторит Telegram-чаты из БД по триггерным словам, создаёт лидов и
-ставит обработку в очередь Celery. Ответы от AI Core — точка интеграции (TODO).
+Сервис мониторит источники (Telegram-чаты, выдачи Avito, посты Instagram) по
+триггерным словам своей ниши, создаёт лидов и ставит обработку в очередь
+Celery. Ответы от AI Core — точка интеграции (TODO).
 
-## Что уже есть (Спринт 1)
+## Что уже есть
 
+Спринт 1:
 - **Мультитенантность**: кампании (ниши) → свои чаты, лиды, настройки.
 - **Список чатов в БД** (`MonitoredChat`), а не в хардкоде — под будущую админку.
 - **Обработка `FloodWaitError`**: слушатель спит нужное время, а не падает.
 - **Опциональный прокси** в Telethon — параметр-заглушка, включается из `.env`.
 - **Суточный лимит исходящих** (25/аккаунт) на счётчике в Redis.
 
+Спринт 2:
+- **Триггеры per-ниша**: правила переехали из хардкода в `Campaign.settings`
+  (JSONB) — keywords + regex + карта действий («бонус» → `send_link`,
+  «кадастровый номер» → `send_map`). Старые кампании работают по legacy-набору.
+- **Пресеты ниш** (`niches.py`): `realty` (участки), `gambling`, `services` —
+  шаблон копируется в кампанию при создании (`scripts/seed.py --preset ...`).
+- **Парсер Avito**: поллинг поисковых выдач через Playwright, антибот-детект.
+- **Парсер Instagram**: мониторинг комментариев постов (нужна кука
+  `INSTAGRAM_SESSIONID`), best-effort селекторы.
+- **Celery beat**: `poll_avito` / `poll_instagram` по расписанию, дедуп
+  обработанных элементов в Redis (TTL `SEEN_ITEMS_TTL_DAYS`).
+
 ## Структура
 
 ```
 parser_service/
-├── config.py              # чтение .env, триггерные слова (пока хардкод)
+├── config.py              # чтение .env, legacy-триггеры, настройки парсеров
+├── niches.py              # пресеты ниш: триггеры/regex/действия (Спринт 2)
+├── triggers.py            # per-campaign правила из Campaign.settings (Спринт 2)
 ├── db/
-│   ├── models.py          # SQLModel: Campaign, MonitoredChat, Lead, Message
+│   ├── models.py          # Campaign, MonitoredChat, MonitoredSource, Lead, Message
 │   └── session.py         # engine + сессии, init_db()
 ├── telegram/
 │   ├── client.py          # TelegramClient (Telethon) + proxy-заглушка
 │   ├── listener.py        # мониторинг чатов, FloodWaitError, постановка в Celery
-│   └── triggers.py        # keyword/regex-матч + точка интеграции AI Core
+│   └── triggers.py        # шим: реэкспорт из parser_service.triggers
+├── parsers/
+│   ├── base.py            # общий пайплайн: fetch → дедуп → триггер → Lead → Celery
+│   ├── browser.py         # общий Playwright-контекст (UA, headless из .env)
+│   ├── avito.py           # поллинг выдач Avito (data-marker селекторы)
+│   └── instagram.py       # комментарии постов IG (sessionid-кука)
 └── celery_app/
-    ├── celery_config.py   # инстанс Celery (брокер/бэкенд = Redis)
-    └── tasks.py           # process_incoming_message, send_outgoing_message
-scripts/seed.py            # завести тестовую кампанию + чат в БД
+    ├── celery_config.py   # инстанс Celery + beat_schedule поллеров
+    └── tasks.py           # process/send + poll_avito, poll_instagram
+scripts/seed.py            # кампания из пресета + чат/источник в БД
 docker-compose.yml         # Postgres + Redis для локальной разработки
 ```
 
@@ -45,6 +66,9 @@ uv sync
 
 # либо классически через pip
 pip install -r requirements.txt
+
+# браузер для веб-парсеров Avito/Instagram (Спринт 2, ~150 МБ, один раз)
+uv run playwright install chromium
 ```
 
 ## 2. Получение API_ID / API_HASH
@@ -74,20 +98,32 @@ Redis поднимется на `localhost:6379`, Postgres — на `localhost:5
 
 Если Redis уже стоит локально — можно без Docker, просто укажи `REDIS_URL` в `.env`.
 
-## 4. Инициализация БД и тестовый чат
+## 4. Инициализация БД: кампании и источники
 
-Таблицы создаются автоматически при старте (`init_db()`), но для первого
-прогона заведём тестовую кампанию и чат:
+Таблицы создаются автоматически при старте (`init_db()`). Кампании создаются
+из пресетов ниш (`--preset realty | gambling | services`) — пресет копируется
+в `Campaign.settings`, дальше триггеры можно править прямо в БД/админке:
 
 ```bash
-# замени @your_test_chat на чат/канал, где ты состоишь
+# Telegram-чат в кампанию «участки» (замени на чат, где ты состоишь)
+uv run python -m scripts.seed telegram @your_test_chat --preset realty
+
+# Поисковая выдача Avito (URL со всеми фильтрами, сортировка «по дате»)
+uv run python -m scripts.seed avito "https://www.avito.ru/moskva/zemelnye_uchastki?s=104" --preset realty
+
+# Пост Instagram — мониторим комментарии под ним
+uv run python -m scripts.seed instagram "https://www.instagram.com/p/XXXX/" --preset gambling
+
+# legacy-режим Спринта 1 (demo-кампания, триггеры из config):
 uv run python -m scripts.seed @your_test_chat
 ```
 
-## 5. Запуск Celery worker
+## 5. Запуск Celery worker (+ beat для поллеров Avito/IG)
 
 ```bash
-uv run celery -A parser_service.celery_app.celery_config:celery_app worker --loglevel=info
+# -B — встроенный beat: раз в AVITO_POLL_INTERVAL / INSTAGRAM_POLL_INTERVAL
+# секунд запускает poll_avito / poll_instagram
+uv run celery -A parser_service.celery_app.celery_config:celery_app worker -B --loglevel=info
 # на Windows при проблемах с пулом добавь:  --pool=solo
 ```
 
@@ -106,11 +142,40 @@ uv run python -m parser_service.telegram.listener
 2. Поставит задачу `process_incoming_message` в Celery.
 3. Celery-worker залогирует `would call AI core here` (заглушка AI Core).
 
-## Триггерные слова
+## Триггерные слова (Спринт 2: per-ниша)
 
-Пока хардкодятся в `parser_service/config.py` → `TRIGGER_KEYWORDS`.
-**TODO:** переедут в `Campaign.settings` (JSONB), чтобы у каждой ниши был
-свой набор, редактируемый из админки.
+Правила живут в `Campaign.settings["triggers"]` (JSONB), формат:
+
+```json
+{
+  "keywords": ["бонус", "промокод"],
+  "regex": ["бонус\\s+за\\s+регистрац"],
+  "actions": {"бонус": "send_link"},
+  "default_action": "send_link"
+}
+```
+
+Действия (задача 2.4 ТЗ): `send_link` — прислать (реф.) ссылку,
+`send_map` — карту участка, `send_price` — прайс, `generic` — обычный ответ.
+Подсказка действия уходит в AI Core вместе с текстом (точка интеграции).
+
+Кампании без `triggers` (Спринт 1) работают по legacy-набору
+`config.TRIGGER_KEYWORDS`. Шаблоны под ниши — `parser_service/niches.py`.
+
+## Парсеры Avito / Instagram (Спринт 2)
+
+- Запускаются Celery beat'ом (`worker -B`), интервалы — в `.env`.
+- **Дедуп**: обработанные объявления/комментарии помнит Redis
+  (`seen:{platform}:{source_id}:{external_id}`, TTL `SEEN_ITEMS_TTL_DAYS` дней) —
+  лиды не дублируются между прогонами.
+- **Avito**: селекторы на `data-marker` атрибутах (стабильнее CSS-классов).
+  При антибот-странице прогон пропускается с warning — уменьшай частоту
+  поллинга; ротация прокси по roadmap — Спринт 4.
+- **Instagram**: без куки `INSTAGRAM_SESSIONID` — стена логина. Разметка IG
+  обфусцирована: селекторы best-effort, при поломке — warning в лог, запасной
+  вариант по ТЗ — бесплатный тариф Apify (instagram-comment-scraper).
+  Соблюдаем правила площадок (ТЗ, раздел 3): редкий поллинг, паузы между
+  источниками.
 
 ## Точки интеграции (TODO для других участников)
 

@@ -32,4 +32,17 @@ celery_app.conf.update(
     task_reject_on_worker_lost=True,
     # Ограничим предвыборку, чтобы задачи с отложенным retry не копились в воркере.
     worker_prefetch_multiplier=1,
+    # --- Расписание поллинга веб-источников (Спринт 2) ---
+    # Запуск: воркер с встроенным beat — celery ... worker -B
+    # (для одного инстанса достаточно; отдельный beat-процесс — на проде).
+    beat_schedule={
+        "poll-avito": {
+            "task": "parser.poll_avito",
+            "schedule": settings.avito_poll_interval,
+        },
+        "poll-instagram": {
+            "task": "parser.poll_instagram",
+            "schedule": settings.instagram_poll_interval,
+        },
+    },
 )

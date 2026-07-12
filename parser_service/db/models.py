@@ -16,9 +16,12 @@ SQLModel-модели под схему БД проекта.
     Если позже понадобится распределённая генерация ключей (шардинг, слияние
     БД нескольких инстансов) — тип PK меняется на UUID точечно, модели к этому
     готовы (FK ссылаются на .id, а не на конкретный тип).
+ПРИМЕЧАНИЕ: в этом модуле НЕЛЬЗЯ включать `from __future__ import annotations` —
+он превращает все аннотации в строки, и SQLModel передаёт в relationship()
+сырую строку "list['MonitoredChat']", которую SQLAlchemy не резолвит
+(InvalidRequestError при первом обращении к модели). Форвард-ссылки в
+кавычках (list["MonitoredChat"]) работают и без future-импорта.
 """
-
-from __future__ import annotations
 
 from datetime import datetime
 from enum import Enum
@@ -49,6 +52,13 @@ class MessageDirection(str, Enum):
     OUTGOING = "outgoing"  # от нас к пользователю (ответ AI/менеджера)
 
 
+class SourcePlatform(str, Enum):
+    """Платформа веб-парсера (Спринт 2). Telegram живёт в MonitoredChat."""
+
+    AVITO = "avito"
+    INSTAGRAM = "instagram"
+
+
 # =============================================================================
 # Campaigns — кампании (ниши)
 # =============================================================================
@@ -73,6 +83,7 @@ class Campaign(SQLModel, table=True):
 
     # Связи (ORM-удобство, не создают отдельных колонок).
     monitored_chats: list["MonitoredChat"] = Relationship(back_populates="campaign")
+    monitored_sources: list["MonitoredSource"] = Relationship(back_populates="campaign")
     leads: list["Lead"] = Relationship(back_populates="campaign")
 
 
@@ -100,6 +111,33 @@ class MonitoredChat(SQLModel, table=True):
     is_active: bool = Field(default=True, index=True)
 
     campaign: Optional[Campaign] = Relationship(back_populates="monitored_chats")
+
+
+# =============================================================================
+# MonitoredSources — источники веб-парсеров (Avito / Instagram), Спринт 2
+# =============================================================================
+class MonitoredSource(SQLModel, table=True):
+    """
+    Источник для поллинг-парсеров: поисковая выдача Avito или пост Instagram.
+
+    Отдельная таблица (а не MonitoredChat), потому что семантика другая:
+    Telegram — подписка на события в реальном времени, здесь — периодический
+    поллинг URL. identifier:
+        avito     — полный URL поисковой выдачи (с фильтрами/сортировкой)
+        instagram — URL поста (мониторим комментарии под ним)
+    """
+
+    __tablename__ = "monitored_sources"
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    campaign_id: int = Field(foreign_key="campaigns.id", index=True)
+    platform: SourcePlatform = Field(index=True)
+    identifier: str = Field(index=True)
+    # Человекочитаемое название источника (для админки/логов).
+    title: Optional[str] = Field(default=None)
+    is_active: bool = Field(default=True, index=True)
+
+    campaign: Optional[Campaign] = Relationship(back_populates="monitored_sources")
 
 
 # =============================================================================

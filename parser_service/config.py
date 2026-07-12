@@ -80,6 +80,24 @@ class Settings:
     # TODO: в будущем лимит станет настройкой кампании/аккаунта, а не глобальной.
     daily_outbox_limit: int = _get_int("DAILY_OUTBOX_LIMIT", 25) or 25
 
+    # --- Веб-парсеры: Avito / Instagram (Спринт 2) ---
+    # Интервалы поллинга (сек). Слишком частый поллинг = бан по IP, поэтому
+    # значения по умолчанию консервативные.
+    avito_poll_interval: int = _get_int("AVITO_POLL_INTERVAL", 300) or 300
+    instagram_poll_interval: int = _get_int("INSTAGRAM_POLL_INTERVAL", 600) or 600
+    # Headless-режим Playwright. Для локальной отладки удобно false (видно браузер).
+    playwright_headless: bool = (
+        os.getenv("PLAYWRIGHT_HEADLESS", "true").lower() == "true"
+    )
+    # Таймаут загрузки страницы, мс.
+    page_timeout_ms: int = _get_int("PARSER_PAGE_TIMEOUT_MS", 30_000) or 30_000
+    # Кука sessionid Instagram (без неё IG почти всё прячет за логином).
+    # Берётся из браузера залогиненного аккаунта: DevTools -> Application ->
+    # Cookies -> instagram.com -> sessionid.
+    instagram_sessionid: str | None = os.getenv("INSTAGRAM_SESSIONID") or None
+    # Сколько дней помним обработанные объявления/комментарии (дедуп в Redis).
+    seen_items_ttl_days: int = _get_int("SEEN_ITEMS_TTL_DAYS", 7) or 7
+
     # --- Логирование ---
     log_level: str = os.getenv("LOG_LEVEL", "INFO")
 

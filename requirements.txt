@@ -1,4 +1,4 @@
-# Прямые зависимости parser_service (Спринт 1).
+# Прямые зависимости parser_service (Спринты 1-2).
 # Источник истины — pyproject.toml + uv.lock. Этот файл для установки без uv:
 #   pip install -r requirements.txt
 # Точные версии всех транзитивных пакетов зафиксированы в uv.lock.
@@ -10,3 +10,5 @@ sqlmodel>=0.0.39      # ORM-модели (SQLAlchemy + Pydantic)
 psycopg2-binary>=2.9  # драйвер Postgres
 python-dotenv>=1.0    # чтение .env
 tenacity>=9.0         # ретраи (задел под сетевые вызовы AI Core)
+playwright>=1.49      # веб-парсеры Avito/Instagram (после установки:
+                      #   playwright install chromium)
